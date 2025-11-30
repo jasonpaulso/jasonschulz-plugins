@@ -6,7 +6,7 @@
   "metadata": {
     "description": "Jason Schulz's Claude Code plugins",
     "version": "1.0.0",
-    "homepage": "https://github.com/jasonschulz"
+    "homepage": "https://github.com/jasonpaulso/jasonschulz-plugins"
   },
   "plugins": [
     {
@@ -18,6 +18,7 @@
         "name": "Jason Schulz"
       },
       "category": "productivity",
+      "homepage": "https://github.com/jasonpaulso/jasonschulz-plugins",
       "keywords": [
         "context",
         "memory",
