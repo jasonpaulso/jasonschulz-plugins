@@ -1,0 +1,33 @@
+{
+  "name": "jasonschulz-plugins",
+  "owner": {
+    "name": "Jason Schulz"
+  },
+  "metadata": {
+    "description": "Jason Schulz's Claude Code plugins",
+    "version": "1.0.0",
+    "homepage": "https://github.com/jasonschulz"
+  },
+  "plugins": [
+    {
+      "name": "project-context-sync",
+      "source": "./plugins/project-context-sync",
+      "description": "Automatic project context synchronization for long-running agent work",
+      "version": "1.1.0",
+      "author": {
+        "name": "Jason Schulz"
+      },
+      "category": "productivity",
+      "keywords": [
+        "context",
+        "memory",
+        "long-running",
+        "progress",
+        "documentation",
+        "session",
+        "handoff"
+      ]
+    }
+  ],
+  "version": "1.0.0"
+}

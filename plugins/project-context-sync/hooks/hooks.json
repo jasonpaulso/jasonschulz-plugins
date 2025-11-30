@@ -1,0 +1,112 @@
+{
+  "description": "Automatic project context synchronization - maintains PROGRESS.md and enforces clean session handoffs",
+  "version": "1.1.0",
+  "author": "Jason Schulz",
+  "lastUpdated": "2025-11-29",
+  "hooks": {
+    "SessionStart": [
+      {
+        "description": "Initialize plugin state and inject current project context",
+        "priority": 100,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-start.js",
+            "description": "Reads PROGRESS.md and git history, outputs context for Claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "description": "Track file modifications and mark context as potentially stale",
+        "matcher": "Write|Edit|NotebookEdit",
+        "priority": 50,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/track-modification.js",
+            "description": "Records modification events for context staleness detection",
+            "timeout": 5,
+            "continueOnError": true,
+            "suppressOutput": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "description": "Prompt context update before memory compaction",
+        "priority": 80,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/pre-compact.js",
+            "description": "Reminds Claude to update PROGRESS.md before context is compacted",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "description": "Pre-validate PROGRESS.md structure before LLM evaluation",
+        "priority": 95,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/validate-progress.js",
+            "description": "Generates machine-readable validation summary for Stop hook prompt",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "description": "Validate context is current before allowing session to end",
+        "priority": 90,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are evaluating whether this Claude Code session can stop. A pre-validation script has already run and its output is included in the context.\n\nReview the validation results and session context to determine:\n\n1. **PROGRESS.md Structure**: Are all required sections present (Current State, Recent Work, Next Steps)?\n   - If sections are missing, the validation output includes a repair template\n   - Block and request the missing sections be added\n\n2. **Documentation Currency**: Is PROGRESS.md up to date with this session's work?\n   - Check 'commitsSinceUpdate' - if > 0, documentation may be stale\n   - Check 'filesModifiedThisSession' - these should be reflected in PROGRESS.md\n   - Check 'uncommittedChanges' - meaningful changes should be committed\n\n3. **Clean State**: Is the project ready for the next session?\n   - No half-implemented features\n   - Clear next steps documented\n   - Any blockers noted\n\nSession context: $ARGUMENTS\n\nRespond with JSON:\n- If all requirements met: {\"decision\": \"approve\", \"reason\": \"Documentation is current and complete.\"}\n- If issues exist: {\"decision\": \"block\", \"reason\": \"Please address: [specific items from validation]\"}",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "description": "Ensure subagents document their work before completing",
+        "priority": 80,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Verify this subagent completed its assigned task and documented progress appropriately. If the subagent made code changes, they should be noted for the main session's PROGRESS.md update.\n\nSubagent context: $ARGUMENTS\n\nRespond with JSON: {\"decision\": \"approve\", \"reason\": \"...\"} if task is complete, or {\"decision\": \"block\", \"reason\": \"...\"} if work is incomplete.",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "description": "Spawn background context finalization using --resume for continuity",
+        "priority": 100,
+        "enabled": true,
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-end.js",
+            "description": "Resumes session for final context update if Stop hook did not complete",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

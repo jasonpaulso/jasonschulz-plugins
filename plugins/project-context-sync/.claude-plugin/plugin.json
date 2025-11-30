@@ -1,0 +1,20 @@
+{
+  "name": "project-context-sync",
+  "version": "1.1.0",
+  "description": "Automatic project context synchronization for long-running agent work. Maintains PROGRESS.md, enforces clean session handoffs, and uses --resume for continuity.",
+  "author": {
+    "name": "Jason Schulz",
+    "url": "https://github.com/jasonschulz"
+  },
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "memory",
+    "long-running",
+    "progress",
+    "documentation",
+    "session",
+    "handoff",
+    "continuity"
+  ]
+}
