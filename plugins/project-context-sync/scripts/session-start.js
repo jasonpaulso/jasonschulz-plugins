@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 /**
- * session-start.js (v1.1)
+ * session-start.js (v1.2)
  * 
  * Runs at SessionStart to inject project context into Claude's awareness.
- * Reads PROGRESS.md and recent git history, outputs as additionalContext.
+ * Reads PROGRESS.md, feature_list.json, and recent git history.
+ * 
+ * v1.2 Changes:
+ * - Added feature_list.json awareness
+ * - Shows current work item with verification criteria
+ * - Runs smoke tests on previous session's completed work
+ * - Feature progress tracking (X of Y items complete)
  * 
  * v1.1 Changes:
  * - Added PROGRESS.md schema validation
@@ -19,6 +25,7 @@ const { execSync } = require('child_process');
 const projectRoot = process.cwd();
 const CLAUDE_DIR = path.join(projectRoot, '.claude');
 const PROGRESS_FILE = path.join(CLAUDE_DIR, 'PROGRESS.md');
+const FEATURE_LIST_FILE = path.join(CLAUDE_DIR, 'feature_list.json');
 const STATE_DIR = path.join(CLAUDE_DIR, '.context-state');
 const CONFIG_FILE = path.join(CLAUDE_DIR, 'context-sync.json');
 
@@ -46,7 +53,9 @@ function loadConfig() {
     requireProgressFile: false,
     gitHistoryLines: 10,
     showFullProgress: true,
-    quietStart: false
+    quietStart: false,
+    runSmokeTests: true,
+    smokeTestTimeout: 30
   };
 
   try {
@@ -139,6 +148,141 @@ function checkSections(content) {
 }
 
 /**
+ * Load and parse feature_list.json
+ */
+function loadFeatureList() {
+  try {
+    if (fs.existsSync(FEATURE_LIST_FILE)) {
+      return JSON.parse(fs.readFileSync(FEATURE_LIST_FILE, 'utf8'));
+    }
+  } catch (e) {
+    // Return null if invalid
+  }
+  return null;
+}
+
+/**
+ * Get the next work item to work on
+ */
+function getNextWorkItem(featureList) {
+  if (!featureList || !featureList.items) return null;
+  
+  // Find first pending item whose dependencies are all complete
+  const completedIds = new Set(
+    featureList.items
+      .filter(item => item.status === 'complete')
+      .map(item => item.id)
+  );
+  
+  // First check for in-progress items
+  const inProgress = featureList.items.find(item => item.status === 'in-progress');
+  if (inProgress) return inProgress;
+  
+  // Find next pending item with satisfied dependencies
+  for (const item of featureList.items) {
+    if (item.status !== 'pending') continue;
+    
+    const deps = item.dependencies || [];
+    const allDepsComplete = deps.every(depId => completedIds.has(depId));
+    
+    if (allDepsComplete) {
+      return item;
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Run verification command with timeout
+ */
+function runVerification(verification, timeout = 30) {
+  try {
+    const result = execSync(verification.command, {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      timeout: timeout * 1000,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    const expectedExit = verification.expectedExitCode || 0;
+    const expectedOutput = verification.expectedOutput;
+    
+    // Check output pattern if specified
+    if (expectedOutput) {
+      const pattern = new RegExp(expectedOutput);
+      if (!pattern.test(result)) {
+        return { passed: false, reason: `Output did not match pattern: ${expectedOutput}` };
+      }
+    }
+    
+    return { passed: true };
+  } catch (e) {
+    const expectedExit = verification.expectedExitCode || 0;
+    if (e.status === expectedExit) {
+      return { passed: true };
+    }
+    return { passed: false, reason: e.message || 'Command failed' };
+  }
+}
+
+/**
+ * Run smoke tests on last completed item
+ */
+function runSmokeTests(featureList, config) {
+  if (!config.runSmokeTests) return null;
+  if (!featureList || !featureList.items) return null;
+  
+  // Find most recently completed item
+  const completedItems = featureList.items
+    .filter(item => item.status === 'complete' && item.completedAt)
+    .sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt));
+  
+  if (completedItems.length === 0) return null;
+  
+  const lastCompleted = completedItems[0];
+  if (!lastCompleted.verification || lastCompleted.verification.length === 0) {
+    return null;
+  }
+  
+  const results = {
+    itemId: lastCompleted.id,
+    itemDescription: lastCompleted.description,
+    tests: []
+  };
+  
+  for (const verification of lastCompleted.verification) {
+    if (verification.optional) continue;
+    
+    const result = runVerification(verification, config.smokeTestTimeout);
+    results.tests.push({
+      command: verification.command,
+      description: verification.description,
+      passed: result.passed,
+      reason: result.reason
+    });
+  }
+  
+  results.allPassed = results.tests.every(t => t.passed);
+  return results;
+}
+
+/**
+ * Calculate feature progress
+ */
+function getFeatureProgress(featureList) {
+  if (!featureList || !featureList.items) return null;
+  
+  const total = featureList.items.length;
+  const completed = featureList.items.filter(i => i.status === 'complete').length;
+  const inProgress = featureList.items.filter(i => i.status === 'in-progress').length;
+  const blocked = featureList.items.filter(i => i.status === 'blocked').length;
+  const pending = featureList.items.filter(i => i.status === 'pending').length;
+  
+  return { total, completed, inProgress, blocked, pending };
+}
+
+/**
  * Initialize state directory and record session
  */
 function initStateDir(sessionId) {
@@ -191,6 +335,91 @@ function main() {
   const contextParts = [];
   
   contextParts.push('### PROJECT CONTEXT START ###');
+  
+  // Check for feature_list.json (multi-session feature tracking)
+  const featureList = loadFeatureList();
+  
+  if (featureList && featureList.status !== 'complete') {
+    const progress = getFeatureProgress(featureList);
+    const nextItem = getNextWorkItem(featureList);
+    
+    contextParts.push('=== ACTIVE FEATURE ===');
+    contextParts.push(`📦 **${featureList.feature}**`);
+    contextParts.push(`Status: ${featureList.status}`);
+    
+    if (progress) {
+      const progressBar = '█'.repeat(progress.completed) + '░'.repeat(progress.total - progress.completed);
+      contextParts.push(`Progress: [${progressBar}] ${progress.completed}/${progress.total} items`);
+      
+      if (progress.blocked > 0) {
+        contextParts.push(`⚠️ ${progress.blocked} item(s) blocked`);
+      }
+    }
+    
+    // Run smoke tests on last completed item
+    if (config.runSmokeTests && progress && progress.completed > 0) {
+      const smokeResults = runSmokeTests(featureList, config);
+      if (smokeResults) {
+        contextParts.push('');
+        contextParts.push('--- Smoke Test (last completed item) ---');
+        contextParts.push(`Item: ${smokeResults.itemId} - ${smokeResults.itemDescription}`);
+        
+        if (smokeResults.allPassed) {
+          contextParts.push('✅ All verification tests still passing');
+        } else {
+          contextParts.push('❌ REGRESSION DETECTED:');
+          for (const test of smokeResults.tests) {
+            if (!test.passed) {
+              contextParts.push(`  - ${test.description}: ${test.reason}`);
+            }
+          }
+          contextParts.push('');
+          contextParts.push('⚠️ Consider fixing regressions before starting new work.');
+        }
+      }
+    }
+    
+    // Show next work item
+    if (nextItem) {
+      contextParts.push('');
+      contextParts.push('--- Next Work Item ---');
+      contextParts.push(`🎯 **${nextItem.id}**: ${nextItem.description}`);
+      contextParts.push(`Effort: ${nextItem.estimatedEffort || 'not estimated'}`);
+      
+      if (nextItem.acceptanceCriteria && nextItem.acceptanceCriteria.length > 0) {
+        contextParts.push('');
+        contextParts.push('Acceptance Criteria:');
+        for (const criterion of nextItem.acceptanceCriteria) {
+          contextParts.push(`  • ${criterion}`);
+        }
+      }
+      
+      if (nextItem.verification && nextItem.verification.length > 0) {
+        contextParts.push('');
+        contextParts.push('Verification Commands:');
+        for (const v of nextItem.verification) {
+          contextParts.push(`  • ${v.description}: \`${v.command}\``);
+        }
+      }
+      
+      if (nextItem.notes) {
+        contextParts.push('');
+        contextParts.push(`Notes: ${nextItem.notes}`);
+      }
+      
+      if (nextItem.dependencies && nextItem.dependencies.length > 0) {
+        contextParts.push(`Dependencies: ${nextItem.dependencies.join(', ')} (all complete)`);
+      }
+    } else if (progress && progress.pending === 0 && progress.inProgress === 0) {
+      contextParts.push('');
+      contextParts.push('🎉 All work items complete! Consider marking feature as complete.');
+    } else if (progress && progress.blocked > 0) {
+      contextParts.push('');
+      contextParts.push('⚠️ Remaining items are blocked. Review blocked items to unblock.');
+    }
+    
+    contextParts.push('');
+  }
   
   // Check for PROGRESS.md
   if (fs.existsSync(PROGRESS_FILE)) {
@@ -247,7 +476,16 @@ function main() {
 
   contextParts.push('\n### PROJECT CONTEXT END ###');
   contextParts.push('');
-  contextParts.push('Review the above context, then choose ONE task to work on this session.');
+  
+  // Contextual guidance based on state
+  if (featureList && featureList.status === 'in-progress') {
+    const nextItem = getNextWorkItem(featureList);
+    if (nextItem) {
+      contextParts.push(`Focus on work item **${nextItem.id}**. Run verification commands when complete.`);
+    }
+  } else {
+    contextParts.push('Review the above context, then choose ONE task to work on this session.');
+  }
 
   // Output context
   if (!config.quietStart) {

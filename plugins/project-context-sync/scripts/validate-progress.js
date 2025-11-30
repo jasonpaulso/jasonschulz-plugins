@@ -1,10 +1,19 @@
 #!/usr/bin/env node
 /**
- * validate-progress.js (v1.1)
+ * validate-progress.js (v1.2)
  * 
- * Pre-validates PROGRESS.md before the Stop hook prompt runs.
+ * Pre-validates PROGRESS.md and feature_list.json before the Stop hook prompt runs.
  * Generates a machine-readable summary that the LLM can use for accurate evaluation.
- * Also validates/repairs PROGRESS.md schema.
+ * 
+ * v1.2 Changes:
+ * - Added feature_list.json validation
+ * - Runs verification commands for current work item
+ * - Reports verification results to Stop hook
+ * - Updates work item status on success
+ * 
+ * v1.1 Changes:
+ * - PROGRESS.md schema validation
+ * - Generates repair templates for missing sections
  * 
  * Called by the Stop hook command before the prompt-based evaluation.
  */
@@ -16,8 +25,10 @@ const { execSync } = require('child_process');
 const projectRoot = process.cwd();
 const CLAUDE_DIR = path.join(projectRoot, '.claude');
 const PROGRESS_FILE = path.join(CLAUDE_DIR, 'PROGRESS.md');
+const FEATURE_LIST_FILE = path.join(CLAUDE_DIR, 'feature_list.json');
 const STATE_DIR = path.join(CLAUDE_DIR, '.context-state');
 const MODIFICATIONS_FILE = path.join(STATE_DIR, 'modifications.json');
+const CONFIG_FILE = path.join(CLAUDE_DIR, 'context-sync.json');
 
 // Required sections in PROGRESS.md
 const REQUIRED_SECTIONS = [
@@ -35,6 +46,29 @@ try {
   }
 } catch (e) {
   // Continue without input
+}
+
+/**
+ * Load plugin configuration
+ */
+function loadConfig() {
+  const defaults = {
+    enabled: true,
+    verificationTimeout: 60,
+    autoUpdateFeatureList: true,
+    requireVerificationPass: true
+  };
+
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+      return { ...defaults, ...userConfig };
+    }
+  } catch (e) {
+    // Use defaults
+  }
+
+  return defaults;
 }
 
 /**
@@ -189,9 +223,172 @@ function generateRepairTemplate(missing) {
 }
 
 /**
+ * Load feature_list.json
+ */
+function loadFeatureList() {
+  try {
+    if (fs.existsSync(FEATURE_LIST_FILE)) {
+      return JSON.parse(fs.readFileSync(FEATURE_LIST_FILE, 'utf8'));
+    }
+  } catch (e) {
+    // Return null if invalid
+  }
+  return null;
+}
+
+/**
+ * Save feature_list.json
+ */
+function saveFeatureList(featureList) {
+  try {
+    fs.writeFileSync(FEATURE_LIST_FILE, JSON.stringify(featureList, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Get current in-progress work item
+ */
+function getCurrentWorkItem(featureList) {
+  if (!featureList || !featureList.items) return null;
+  return featureList.items.find(item => item.status === 'in-progress');
+}
+
+/**
+ * Run a single verification command
+ */
+function runVerification(verification, timeout = 60) {
+  const result = {
+    command: verification.command,
+    description: verification.description || verification.command,
+    passed: false,
+    output: '',
+    error: null,
+    duration: 0
+  };
+  
+  const startTime = Date.now();
+  
+  try {
+    const output = execSync(verification.command, {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      timeout: timeout * 1000,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    result.output = output.substring(0, 1000); // Limit output size
+    result.duration = Date.now() - startTime;
+    
+    const expectedExit = verification.expectedExitCode || 0;
+    const expectedOutput = verification.expectedOutput;
+    
+    // Check output pattern if specified
+    if (expectedOutput) {
+      const pattern = new RegExp(expectedOutput);
+      if (!pattern.test(output)) {
+        result.error = `Output did not match pattern: ${expectedOutput}`;
+        return result;
+      }
+    }
+    
+    result.passed = true;
+    return result;
+  } catch (e) {
+    result.duration = Date.now() - startTime;
+    result.error = e.message || 'Command failed';
+    result.output = (e.stdout || '') + (e.stderr || '');
+    
+    const expectedExit = verification.expectedExitCode || 0;
+    if (e.status === expectedExit) {
+      result.passed = true;
+      result.error = null;
+    }
+    
+    return result;
+  }
+}
+
+/**
+ * Run all verification commands for a work item
+ */
+function runWorkItemVerification(workItem, config) {
+  if (!workItem || !workItem.verification || workItem.verification.length === 0) {
+    return {
+      itemId: workItem?.id,
+      hasVerification: false,
+      skipped: true
+    };
+  }
+  
+  const results = {
+    itemId: workItem.id,
+    itemDescription: workItem.description,
+    hasVerification: true,
+    skipped: false,
+    tests: [],
+    allPassed: false,
+    requiredPassed: false
+  };
+  
+  for (const verification of workItem.verification) {
+    const testResult = runVerification(verification, config.verificationTimeout);
+    testResult.optional = verification.optional || false;
+    results.tests.push(testResult);
+  }
+  
+  // Check if all tests passed
+  results.allPassed = results.tests.every(t => t.passed);
+  
+  // Check if all required (non-optional) tests passed
+  results.requiredPassed = results.tests
+    .filter(t => !t.optional)
+    .every(t => t.passed);
+  
+  return results;
+}
+
+/**
+ * Update work item status based on verification results
+ */
+function updateWorkItemStatus(featureList, itemId, verificationResults, sessionId, config) {
+  if (!config.autoUpdateFeatureList) return null;
+  if (!featureList || !featureList.items) return null;
+  
+  const item = featureList.items.find(i => i.id === itemId);
+  if (!item) return null;
+  
+  if (verificationResults.requiredPassed) {
+    item.status = 'complete';
+    item.completedAt = new Date().toISOString();
+    item.sessionId = sessionId;
+    
+    // Update feature status if all items complete
+    const allComplete = featureList.items.every(i => i.status === 'complete');
+    if (allComplete) {
+      featureList.status = 'complete';
+    }
+    
+    // Increment completed sessions count
+    featureList.completedSessions = (featureList.completedSessions || 0) + 1;
+    featureList.updated = new Date().toISOString();
+    
+    saveFeatureList(featureList);
+    return 'complete';
+  }
+  
+  return null;
+}
+
+/**
  * Main
  */
 function main() {
+  const config = loadConfig();
+  const sessionId = hookInput.session_id || null;
+  
   const validation = {
     progressExists: false,
     sectionsFound: [],
@@ -202,7 +399,13 @@ function main() {
     modifiedFiles: [],
     issues: [],
     canAutoRepair: false,
-    repairTemplate: null
+    repairTemplate: null,
+    // New: feature list validation
+    featureListExists: false,
+    featureStatus: null,
+    currentWorkItem: null,
+    verificationResults: null,
+    workItemUpdated: null
   };
 
   // Check if PROGRESS.md exists
@@ -255,9 +458,75 @@ ${generateRepairTemplate(REQUIRED_SECTIONS)}`;
     validation.issues.push(`${mods.count} file modifications this session but no PROGRESS.md`);
   }
 
+  // Feature list validation and verification
+  const featureList = loadFeatureList();
+  
+  if (featureList) {
+    validation.featureListExists = true;
+    validation.featureStatus = featureList.status;
+    
+    // Check for in-progress work item
+    const currentItem = getCurrentWorkItem(featureList);
+    
+    if (currentItem) {
+      validation.currentWorkItem = {
+        id: currentItem.id,
+        description: currentItem.description,
+        hasVerification: !!(currentItem.verification && currentItem.verification.length > 0)
+      };
+      
+      // Run verification commands
+      const verificationResults = runWorkItemVerification(currentItem, config);
+      validation.verificationResults = verificationResults;
+      
+      if (verificationResults.hasVerification && !verificationResults.skipped) {
+        if (verificationResults.requiredPassed) {
+          // All required tests passed - can mark complete
+          const updateResult = updateWorkItemStatus(
+            featureList, 
+            currentItem.id, 
+            verificationResults, 
+            sessionId, 
+            config
+          );
+          validation.workItemUpdated = updateResult;
+          
+          if (updateResult === 'complete') {
+            // Not an issue, but inform the LLM
+            validation.issues.push(`Work item ${currentItem.id} verified and marked complete`);
+          }
+        } else {
+          // Some required tests failed - block session end if configured
+          const failedTests = verificationResults.tests.filter(t => !t.passed && !t.optional);
+          const failedDescriptions = failedTests.map(t => t.description).join(', ');
+          
+          if (config.requireVerificationPass) {
+            validation.issues.push(
+              `Work item ${currentItem.id} verification FAILED: ${failedDescriptions}`
+            );
+          }
+        }
+      } else if (!verificationResults.hasVerification) {
+        // No verification commands defined - warn but don't block
+        validation.issues.push(
+          `Work item ${currentItem.id} has no verification commands defined`
+        );
+      }
+    } else if (featureList.status === 'in-progress') {
+      // Feature in progress but no item marked in-progress
+      const pendingItems = featureList.items.filter(i => i.status === 'pending');
+      if (pendingItems.length > 0) {
+        validation.issues.push(
+          `Feature in progress but no work item is in-progress. Next: ${pendingItems[0].id}`
+        );
+      }
+    }
+  }
+
   // Output validation summary for the Stop hook
   const summary = {
-    valid: validation.issues.length === 0,
+    valid: validation.issues.length === 0 || 
+           validation.issues.every(i => i.includes('verified and marked complete')),
     issues: validation.issues,
     details: {
       progressExists: validation.progressExists,
@@ -266,7 +535,24 @@ ${generateRepairTemplate(REQUIRED_SECTIONS)}`;
       commitsSinceUpdate: validation.commitsSinceUpdate,
       uncommittedChanges: validation.uncommittedChanges,
       filesModifiedThisSession: validation.modifiedFiles.length,
-      modifiedFiles: validation.modifiedFiles.slice(0, 10) // Limit for context size
+      modifiedFiles: validation.modifiedFiles.slice(0, 10), // Limit for context size
+      // Feature list details
+      featureList: validation.featureListExists ? {
+        status: validation.featureStatus,
+        currentWorkItem: validation.currentWorkItem,
+        verificationResults: validation.verificationResults ? {
+          itemId: validation.verificationResults.itemId,
+          allPassed: validation.verificationResults.allPassed,
+          requiredPassed: validation.verificationResults.requiredPassed,
+          tests: validation.verificationResults.tests?.map(t => ({
+            description: t.description,
+            passed: t.passed,
+            optional: t.optional,
+            error: t.error
+          }))
+        } : null,
+        workItemUpdated: validation.workItemUpdated
+      } : null
     },
     autoRepair: validation.canAutoRepair ? {
       available: true,
@@ -278,7 +564,13 @@ ${generateRepairTemplate(REQUIRED_SECTIONS)}`;
   console.log(JSON.stringify(summary, null, 2));
   
   // Exit code indicates whether validation passed
-  process.exit(validation.issues.length === 0 ? 0 : 1);
+  // Consider verification failures as blocking if configured
+  const hasBlockingIssues = validation.issues.some(i => 
+    !i.includes('verified and marked complete') &&
+    (config.requireVerificationPass ? true : !i.includes('verification FAILED'))
+  );
+  
+  process.exit(hasBlockingIssues ? 1 : 0);
 }
 
 main();

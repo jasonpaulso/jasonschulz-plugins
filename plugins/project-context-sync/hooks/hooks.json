@@ -1,20 +1,20 @@
 {
-  "description": "Automatic project context synchronization - maintains PROGRESS.md and enforces clean session handoffs",
-  "version": "1.1.0",
+  "description": "Automatic project context synchronization - maintains PROGRESS.md, feature_list.json, and enforces clean session handoffs with verification",
+  "version": "1.2.0",
   "author": "Jason Schulz",
-  "lastUpdated": "2025-11-29",
+  "lastUpdated": "2025-11-30",
   "hooks": {
     "SessionStart": [
       {
-        "description": "Initialize plugin state and inject current project context",
+        "description": "Initialize plugin state and inject current project context including active features",
         "priority": 100,
         "enabled": true,
         "hooks": [
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-start.js",
-            "description": "Reads PROGRESS.md and git history, outputs context for Claude",
-            "timeout": 10
+            "description": "Reads PROGRESS.md, feature_list.json, runs smoke tests, outputs context for Claude",
+            "timeout": 45
           }
         ]
       }
@@ -54,27 +54,27 @@
     ],
     "Stop": [
       {
-        "description": "Pre-validate PROGRESS.md structure before LLM evaluation",
+        "description": "Pre-validate PROGRESS.md and feature_list.json, run verification commands",
         "priority": 95,
         "enabled": true,
         "hooks": [
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/validate-progress.js",
-            "description": "Generates machine-readable validation summary for Stop hook prompt",
-            "timeout": 10
+            "description": "Validates documentation, runs work item verification commands, updates feature_list.json",
+            "timeout": 120
           }
         ]
       },
       {
-        "description": "Validate context is current before allowing session to end",
+        "description": "Evaluate session completion including work item verification results",
         "priority": 90,
         "enabled": true,
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "You are evaluating whether this Claude Code session can stop. A pre-validation script has already run and its output is included in the context.\n\nReview the validation results and session context to determine:\n\n1. **PROGRESS.md Structure**: Are all required sections present (Current State, Recent Work, Next Steps)?\n   - If sections are missing, the validation output includes a repair template\n   - Block and request the missing sections be added\n\n2. **Documentation Currency**: Is PROGRESS.md up to date with this session's work?\n   - Check 'commitsSinceUpdate' - if > 0, documentation may be stale\n   - Check 'filesModifiedThisSession' - these should be reflected in PROGRESS.md\n   - Check 'uncommittedChanges' - meaningful changes should be committed\n\n3. **Clean State**: Is the project ready for the next session?\n   - No half-implemented features\n   - Clear next steps documented\n   - Any blockers noted\n\nSession context: $ARGUMENTS\n\nRespond with JSON:\n- If all requirements met: {\"decision\": \"approve\", \"reason\": \"Documentation is current and complete.\"}\n- If issues exist: {\"decision\": \"block\", \"reason\": \"Please address: [specific items from validation]\"}",
-            "timeout": 45
+            "prompt": "You are evaluating whether this Claude Code session can stop. A pre-validation script has already run and its output is included in the context.\n\nReview the validation results and session context to determine:\n\n## 1. Feature Work Item Status (if feature_list.json exists)\n\nCheck `details.featureList` in validation output:\n- If `currentWorkItem` exists and `verificationResults.requiredPassed` is true:\n  - Work item was verified and marked complete ✅\n  - This is a clean session end\n- If `currentWorkItem` exists and `verificationResults.requiredPassed` is false:\n  - Verification FAILED - block session end\n  - Show which tests failed from `verificationResults.tests`\n  - Request fixes before allowing session to end\n- If `currentWorkItem` has no verification commands:\n  - Warn but don't block - ask user to confirm work is complete\n\n## 2. PROGRESS.md Structure\n\nCheck `details.sectionsPresent` and `details.sectionsMissing`:\n- Required sections: Current State, Recent Work, Next Steps\n- If sections are missing, the validation output includes a repair template\n- Block and request the missing sections be added\n\n## 3. Documentation Currency\n\nCheck:\n- `commitsSinceUpdate` - if > 0, documentation may be stale\n- `filesModifiedThisSession` - these should be reflected in PROGRESS.md\n- `uncommittedChanges` - meaningful changes should be committed\n\n## 4. Clean State\n\nIs the project ready for the next session?\n- No half-implemented features\n- Clear next steps documented\n- Any blockers noted\n- If feature work, next work item should be clear\n\nSession context: $ARGUMENTS\n\nRespond with JSON:\n- If all requirements met: {\"decision\": \"approve\", \"reason\": \"Work item verified and documentation complete.\"}\n- If verification failed: {\"decision\": \"block\", \"reason\": \"Work item verification failed: [specific failures]. Fix and re-run verification.\"}\n- If other issues: {\"decision\": \"block\", \"reason\": \"Please address: [specific items]\"}",
+            "timeout": 60
           }
         ]
       }
